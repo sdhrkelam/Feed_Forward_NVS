@@ -1,0 +1,10 @@
+{
+  "stage": "test",
+  "total_scenes": 1,
+  "successful_scenes": 1,
+  "failed_scenes": 0,
+  "failed_scene_details": [],
+  "save_tokens_only": true,
+  "data_root": "/storage/users/rajivs/sudheerbabu/Models_oct/main/1/dataset/dl3dv",
+  "output_path": "/storage/users/rajivs/sudheerbabu/Models_oct/main/1/dataset/dl3dv_pt1"
+}
