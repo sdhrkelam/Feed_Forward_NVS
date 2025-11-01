@@ -29,7 +29,11 @@ model:
     freeze_module: patch_embed
     voxelize: true
     intermediate_layer_idx: [4, 11, 17, 23]
-    
+    pretrained_features: true
+    freeze_aggregator: true
+    save_feats: true
+    comp_aggregator: true
+
 dataset:
   dl3dv:
     input_image_shape: [224, 448]
@@ -45,6 +49,8 @@ dataset:
     intr_augment: true
     normalize_by_pts3d: false
     rescale_to_1cube: false
+    fixed_context_indices: null
+    fixed_target_indices: null
 
 optimizer:
   lr: 2e-4

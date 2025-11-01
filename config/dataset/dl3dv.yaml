@@ -17,3 +17,6 @@ avg_pose: false
 rescale_to_1cube: true
 make_baseline_1: false
 intr_augment: true
+
+fixed_context_indices: null
+fixed_target_indices: null

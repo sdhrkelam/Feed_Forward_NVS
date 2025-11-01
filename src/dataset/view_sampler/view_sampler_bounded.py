@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 from jaxtyping import Float, Int64
@@ -22,6 +22,7 @@ class ViewSamplerBoundedCfg:
     max_img_per_gpu: int
     min_gap_multiplier: int
     max_gap_multiplier: int
+    use_fixed_indices: bool = False  # New hyperparameter
 
 class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
     def schedule(self, initial: int, final: int) -> int:
@@ -35,11 +36,34 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
         extrinsics: Float[Tensor, "view 4 4"],
         intrinsics: Float[Tensor, "view 3 3"],
         device: torch.device = torch.device("cpu"),
+        fixed_context_indices: Optional[Int64[Tensor, " context_view"]] = None,
+        fixed_target_indices: Optional[Int64[Tensor, " target_view"]] = None,
     ) -> tuple[
         Int64[Tensor, " context_view"],  # indices for context views
         Int64[Tensor, " target_view"],  # indices for target views
         Float[Tensor, " overlap"],  # overlap
     ]:
+        # If use_fixed_indices is True, use the provided fixed indices
+        if self.cfg.use_fixed_indices:
+            if fixed_context_indices is None or fixed_target_indices is None:
+                raise ValueError(
+                    "use_fixed_indices is True but fixed_context_indices or "
+                    "fixed_target_indices are not provided"
+                )
+            if len(fixed_context_indices) != num_context_views:
+                raise ValueError(
+                    f"Number of fixed_context_indices ({len(fixed_context_indices)}) "
+                    f"does not match num_context_views ({num_context_views})"
+                )
+            
+            overlap = torch.tensor([0.5], dtype=torch.float32, device=device)  # dummy
+            return (
+                fixed_context_indices.to(device),
+                fixed_target_indices.to(device),
+                overlap
+            )
+        
+        # Original sampling strategy
         num_views, _, _ = extrinsics.shape
 
         # Compute the context view spacing based on the current global step.

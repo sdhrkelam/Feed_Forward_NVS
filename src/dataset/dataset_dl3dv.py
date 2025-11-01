@@ -41,6 +41,8 @@ class DatasetDl3dvCfg(DatasetCfgCommon):
     intr_augment: bool
     normalize_by_pts3d: bool
     rescale_to_1cube: bool
+    fixed_context_indices: list[int] | None = None  # Add these
+    fixed_target_indices: list[int] | None = None   # Add these
 
 
 @dataclass
@@ -70,6 +72,17 @@ class DatasetDL3DV(Dataset):
         self.stage = stage
         self.view_sampler = view_sampler
         self.to_tensor = tf.ToTensor()
+        # Convert fixed indices to tensors if provided
+        self.fixed_context_indices = (
+            torch.tensor(cfg.fixed_context_indices, dtype=torch.int64)
+            if cfg.fixed_context_indices is not None
+            else None
+        )
+        self.fixed_target_indices = (
+            torch.tensor(cfg.fixed_target_indices, dtype=torch.int64)
+            if cfg.fixed_target_indices is not None
+            else None
+        )
         
         # load data
         self.data_root = cfg.roots[0]
@@ -202,6 +215,9 @@ class DatasetDL3DV(Dataset):
                 num_context_views,
                 extrinsics,
                 intrinsics,
+                # Pass None for fixed indices - they'll only be used if use_fixed_indices=True
+                fixed_context_indices=self.fixed_context_indices,
+                fixed_target_indices=self.fixed_target_indices,
             )
         except ValueError:
             # Skip because the example doesn't have enough frames.

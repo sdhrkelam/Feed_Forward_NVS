@@ -59,6 +59,8 @@ from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from .ply_export import export_ply
+import json
+
 
 @dataclass
 class OptimizerCfg:
@@ -175,6 +177,7 @@ class ModelWrapper(LightningModule):
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
         # torch.cuda.empty_cache()
+        save_feats_enabled = get_cfg()["model"]["encoder"]["save_feats"]
         if isinstance(batch, list):
             batch_combined = None
             for batch_per_dl in batch:
@@ -194,11 +197,44 @@ class ModelWrapper(LightningModule):
         batch: BatchedExample = self.data_shim(batch)
         b, v, c, h, w = batch["context"]["image"].shape
         context_image = (batch["context"]["image"] + 1) / 2
-        
+        pretrained_feats_enabled = get_cfg()["model"]["encoder"]["pretrained_features"]
         # Run the model.
         visualization_dump = None
+        if pretrained_feats_enabled:
+            # Extract clean scene names (remove "dl3dv_" prefix)
+            clean_scene_names = []
+            if batch.get("scene"):
+                for scene_name in batch["scene"]:
+                    # Remove "dl3dv_" prefix if it exists
+                    if scene_name.startswith("dl3dv_"):
+                        clean_name = scene_name.replace("dl3dv_", "")
+                    else:
+                        clean_name = scene_name
+                    clean_scene_names.append(clean_name)
 
-        encoder_output, output = self.model(context_image, self.global_step, visualization_dump=visualization_dump)
+            if isinstance(clean_scene_names, list):
+            # Multi-batch: load features for each scene and stack them
+                batch_aggregated_tokens = []
+                for scene in clean_scene_names:
+                    scene_features = torch.load(f"/data/sudheerbabu/oct/models/4/feats/aggregator_feats/{scene}/aggregated_list.pt", map_location=context_image.device)
+                    batch_aggregated_tokens.append(scene_features)
+                
+                # Stack features across batch dimension for each layer
+                num_layers = len(batch_aggregated_tokens[0])
+                aggregated_tokens_list = []
+                for layer_idx in range(num_layers):
+                    layer_features = [batch_features[layer_idx] for batch_features in batch_aggregated_tokens]
+                    aggregated_tokens_list.append(torch.stack(layer_features, dim=0))
+            else:
+                if save_feats_enabled:
+                    aggregated_tokens_list = torch.load(f"/data/sudheerbabu/oct/models/4/feats/temp_feats/aggregated_list.pt", map_location=context_image.device)
+                else:
+                    # Single scene (backward compatibility)
+                    aggregated_tokens_list = torch.load(f"/data/sudheerbabu/oct/models/4/feats/aggregator_feats/{scene_name}/aggregated_list.pt", map_location=context_image.device)
+        else:
+            aggregated_tokens_list = None
+
+        encoder_output, output = self.model(context_image, self.global_step, visualization_dump=visualization_dump, pretrained_features=aggregated_tokens_list)
         gaussians, pred_pose_enc_list, depth_dict = encoder_output.gaussians, encoder_output.pred_pose_enc_list, encoder_output.depth_dict
         pred_context_pose = encoder_output.pred_context_pose
         infos = encoder_output.infos
@@ -221,17 +257,23 @@ class ModelWrapper(LightningModule):
         )
         self.log("train/psnr_probabilistic", psnr_probabilistic.mean())
 
+        # Use conf_mask from distill_infos if available, otherwise use all ones
+        if distill_infos is not None and 'conf_mask' in distill_infos:
+            valid_mask = rearrange(distill_infos['conf_mask'], "b v h w -> (b v) h w")
+        else:
+            valid_mask = rearrange(torch.ones_like(output.depth, device=output.depth.device, dtype=torch.bool), "b v h w -> (b v) h w")
+
         consis_absrel = abs_relative_difference(
             rearrange(output.depth, "b v h w -> (b v) h w"),
             rearrange(depth_dict['depth'].squeeze(-1), "b v h w -> (b v) h w"),
-            rearrange(distill_infos['conf_mask'], "b v h w -> (b v) h w"),
+            valid_mask=valid_mask,
         )
         self.log("train/consis_absrel", consis_absrel.mean())
 
         consis_delta1 = delta1_acc(
             rearrange(output.depth, "b v h w -> (b v) h w"),
             rearrange(depth_dict['depth'].squeeze(-1), "b v h w -> (b v) h w"),
-            rearrange(distill_infos['conf_mask'], "b v h w -> (b v) h w"),
+            valid_mask=valid_mask,
         )
         self.log("train/consis_delta1", consis_delta1.mean())
         
@@ -252,7 +294,7 @@ class ModelWrapper(LightningModule):
                 self.log("loss/ctx_depth", loss_depth)
                 total_loss = total_loss + loss_depth
 
-            if distill_infos is not None:
+            if distill_infos is not None and len(distill_infos) > 0 and hasattr(self, 'loss_distill'):
                 # distill ctx pred_pose & depth & normal
                 loss_distill_list = self.loss_distill(distill_infos, pred_pose_enc_list, output, batch)
                 self.log("loss/distill", loss_distill_list['loss_distill'])
@@ -284,15 +326,21 @@ class ModelWrapper(LightningModule):
             )
             
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
-        
+
+        del batch, target_gt, output, encoder_output
+        torch.cuda.empty_cache()
+        gc.collect()   
         # Tell the data loader processes about the current step.
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
         
-        del batch
         if self.global_step % 50 == 0:
             gc.collect()
             torch.cuda.empty_cache()
+
+        # if self.global_step == 6:
+        #     print("exit(0)", self.global_step)
+        #     exit(0)
 
         return total_loss
     
@@ -465,15 +513,52 @@ class ModelWrapper(LightningModule):
             print(
                 f"validation step {self.global_step}; "
                 f"scene = {batch['scene']}; "
-                f"context = {batch['context']['index'].tolist()}"
+                f"target = {batch['target']['index'].tolist()}"
             )
+        save_feats_enabled = get_cfg()["model"]["encoder"]["save_feats"]
+        pretrained_feats_enabled = get_cfg()["model"]["encoder"]["pretrained_features"]
 
         # Render Gaussians.
-        b, v, _, h, w = batch["context"]["image"].shape
+        b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
         visualization_dump = {}
 
-        encoder_output, output = self.model(batch["context"]["image"], self.global_step, visualization_dump=visualization_dump)
+        # Extract clean scene names (remove "dl3dv_" prefix)
+        clean_scene_names = []
+        if batch.get("scene"):
+            for scene_name in batch["scene"]:
+                # Remove "dl3dv_" prefix if it exists
+                if scene_name.startswith("dl3dv_"):
+                    clean_name = scene_name.replace("dl3dv_", "")
+                else:
+                    clean_name = scene_name
+                clean_scene_names.append(clean_name)
+        if pretrained_feats_enabled:
+            if isinstance(clean_scene_names, list):
+            # Multi-batch: load features for each scene and stack them
+                batch_aggregated_tokens = []
+                for scene in clean_scene_names:
+                    if save_feats_enabled:
+                        aggregated_tokens_list = torch.tensor([1,2,3,4], device=batch["context"]["image"].device) #torch.load(f"/data/sudheerbabu/oct/models/4/feats/temp_feats/aggregated_list.pt", map_location=batch["context"]["image"].device)
+                    else:
+                        scene_features = torch.load(f"/data/sudheerbabu/oct/models/4/feats/aggregator_feats/{scene}/aggregated_list.pt", map_location=batch["context"]["image"].device)
+                        batch_aggregated_tokens.append(scene_features)
+                        
+                        # Stack features across batch dimension for each layer
+                        num_layers = len(batch_aggregated_tokens[0])
+                        aggregated_tokens_list = []
+                        for layer_idx in range(num_layers):
+                            layer_features = [batch_features[layer_idx] for batch_features in batch_aggregated_tokens]
+                            aggregated_tokens_list.append(torch.stack(layer_features, dim=0))
+            else:
+                if save_feats_enabled:
+                    aggregated_tokens_list = None #torch.load(f"/data/sudheerbabu/oct/models/4/feats/temp_feats/aggregated_list.pt", map_location=context_image.device)
+                else:
+                    # Single scene (backward compatibility)
+                    aggregated_tokens_list = torch.load(f"/data/sudheerbabu/oct/models/4/feats/aggregator_feats/{scene_name}/aggregated_list.pt", map_location=context_image.device)
+        else:
+            aggregated_tokens_list = None
+        encoder_output, output = self.model(batch["target"]["image"], self.global_step, visualization_dump=visualization_dump, pretrained_features=aggregated_tokens_list)
         gaussians, pred_pose_enc_list, depth_dict = encoder_output.gaussians, encoder_output.pred_pose_enc_list, encoder_output.depth_dict
         pred_context_pose, distill_infos = encoder_output.pred_context_pose, encoder_output.distill_infos
         infos = encoder_output.infos
@@ -492,7 +577,7 @@ class ModelWrapper(LightningModule):
             gaussian_means = gaussian_means.mean(dim=-1)
 
         # Compute validation metrics.
-        rgb_gt = (batch["context"]["image"][0].float() + 1) / 2
+        rgb_gt = (batch["target"]["image"][0].float() + 1) / 2
         psnr = compute_psnr(rgb_gt, rgb_pred).mean()
         self.log(f"val/psnr", psnr)
         lpips = compute_lpips(rgb_gt, rgb_pred).mean()
@@ -515,34 +600,77 @@ class ModelWrapper(LightningModule):
         self.log("val/consis_delta1", consis_delta1.mean())
 
         diff_map = torch.abs(output.depth - depth_dict['depth'].squeeze(-1))
-        self.log("val/consis_mse", diff_map[distill_infos['conf_mask']].mean())
+        
+        if distill_infos is not None and 'conf_mask' in distill_infos:
+            self.log("val/consis_mse", diff_map[distill_infos['conf_mask']].mean())
+        else:
+            self.log("val/consis_mse", diff_map.mean())
+
+        # New diff map: distill depth vs rendered depth
+        if distill_infos is not None and 'depth_map' in distill_infos:
+            distill_diff_map = torch.abs(depth_dict['depth'].squeeze(-1) - distill_infos['depth_map'].squeeze(-1))
+            self.log("val/consis_mse_distill", distill_diff_map[distill_infos['conf_mask']].mean())
+        else:
+            distill_diff_map = None
 
         # Construct comparison image.
-        context_img = inverse_normalize(batch["context"]["image"][0])
+        context_img = inverse_normalize(batch["target"]["image"][0])
         # context_img_depth = vis_depth_map(gaussian_means)
         context = []
         for i in range(context_img.shape[0]):
             context.append(context_img[i])
             # context.append(context_img_depth[i])
         
-        colored_diff_map = vis_depth_map(diff_map[0], near=torch.tensor(1e-4, device=diff_map.device), far=torch.tensor(1.0, device=diff_map.device))
+        
+        def to_bw_map(diff):
+            """
+            Convert (b, v, h, w) diff map to 3-channel grayscale images.
+            """
+            b, v, h, w = diff.shape
+
+            # normalize per-image
+            diff = diff - diff.amin(dim=(2,3), keepdim=True)
+            diff = diff / (diff.amax(dim=(2,3), keepdim=True) + 1e-8)
+
+            # expand to RGB: (b, v, h, w) -> (b, v, 3, h, w)
+            diff = diff.unsqueeze(2).repeat(1, 1, 3, 1, 1)
+            return diff
+
+        # colored_diff_map = vis_depth_map(diff_map[0], near=torch.tensor(1e-4, device=diff_map.device), far=torch.tensor(1.0, device=diff_map.device))
         model_depth_pred = depth_dict["depth"].squeeze(-1)[0]
         model_depth_pred = vis_depth_map(model_depth_pred)
         
-        render_normal = (get_normal_map(output.depth.flatten(0, 1), batch["context"]["intrinsics"].flatten(0, 1)).permute(0, 3, 1, 2) + 1) / 2.
-        pred_normal = (get_normal_map(depth_dict['depth'].flatten(0, 1).squeeze(-1), batch["context"]["intrinsics"].flatten(0, 1)).permute(0, 3, 1, 2) + 1) / 2.
+        # render_normal = (get_normal_map(output.depth.flatten(0, 1), batch["target"]["intrinsics"].flatten(0, 1)).permute(0, 3, 1, 2) + 1) / 2.
+        # pred_normal = (get_normal_map(depth_dict['depth'].flatten(0, 1).squeeze(-1), batch["target"]["intrinsics"].flatten(0, 1)).permute(0, 3, 1, 2) + 1) / 2.
 
-        comparison = hcat(
+        bw_diff_map = to_bw_map(diff_map)[0]              # (v, 3, h, w)
+        bw_distill_diff_map = to_bw_map(distill_diff_map)[0] if distill_diff_map is not None else None
+        
+        
+        # Build comparison components, filtering out None values
+        comparison_parts = [
             add_label(vcat(*context), "Context"),
             add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
             add_label(vcat(*rgb_pred), "Target (Prediction)"),
             add_label(vcat(*depth_pred), "Depth (Prediction)"),
-            add_label(vcat(*model_depth_pred), "Depth (VGGT Prediction)"),
-            add_label(vcat(*render_normal), "Normal (Prediction)"),
-            add_label(vcat(*pred_normal), "Normal (VGGT Prediction)"),
-            add_label(vcat(*colored_diff_map), "Diff Map"),
-        )
-
+        ]
+        
+        # Add distill depth map if available
+        if distill_infos is not None and 'depth_map' in distill_infos:
+            comparison_parts.append(
+                add_label(vcat(*vis_depth_map(distill_infos['depth_map'].squeeze(-1)[0])), "Depth (Distill GT)")
+            )
+        
+        comparison_parts.append(add_label(vcat(*model_depth_pred), "Depth (VGGT Prediction)"))
+        comparison_parts.append(add_label(vcat(*bw_diff_map), "Diff: Model vs Render"))
+        
+        # Add distill diff map if available
+        if bw_distill_diff_map is not None:
+            comparison_parts.append(
+                add_label(vcat(*bw_distill_diff_map), "Diff: Distill vs Model")
+            )
+        
+        comparison = hcat(*comparison_parts)
         comparison = torch.nn.functional.interpolate(
             comparison.unsqueeze(0), 
             scale_factor=0.5, 
@@ -586,17 +714,17 @@ class ModelWrapper(LightningModule):
         #     "cameras", [prep_image(add_border(cameras))], step=self.global_step
         # )
 
-        if self.encoder_visualizer is not None:
-            for k, image in self.encoder_visualizer.visualize(
-                batch["context"], self.global_step
-            ).items():
-                self.logger.log_image(k, [prep_image(image)], step=self.global_step)
+    #     if self.encoder_visualizer is not None:
+    #         for k, image in self.encoder_visualizer.visualize(
+    #             batch["target"], self.global_step
+    #         ).items():
+    #             self.logger.log_image(k, [prep_image(image)], step=self.global_step)
         
-        # Run video validation step.
-        self.render_video_interpolation(batch)
-        self.render_video_wobble(batch)
-        if self.train_cfg.extended_visualization:
-            self.render_video_interpolation_exaggerated(batch)
+    #     # # Run video validation step.
+    #     # self.render_video_interpolation(batch)
+    #     # self.render_video_wobble(batch)
+    #     # if self.train_cfg.extended_visualization:
+    #     #     self.render_video_interpolation_exaggerated(batch)
 
     @rank_zero_only
     def render_video_wobble(self, batch: BatchedExample) -> None:

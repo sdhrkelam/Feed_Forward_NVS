@@ -120,7 +120,8 @@ class DynamicBatchSampler(Sampler):
                  h_range,
                  epoch=0,
                  seed=42,
-                 max_img_per_gpu=48):
+                 max_img_per_gpu=48,
+                 use_fixed_indices=False):  # Add this parameter
         """
         Initializes the dynamic batch sampler.
 
@@ -128,14 +129,17 @@ class DynamicBatchSampler(Sampler):
             sampler: Instance of DynamicDistributedSampler.
             aspect_ratio_range: List containing [min_aspect_ratio, max_aspect_ratio].
             image_num_range: List containing [min_images, max_images] per sample.
+            h_range: Height range for patches.
             epoch: Current epoch number.
             seed: Random seed for reproducibility.
             max_img_per_gpu: Maximum number of images to fit in GPU memory.
+            use_fixed_indices: If True, use fixed num_context_views instead of random sampling.
         """
         self.sampler = sampler
         self.image_num_range = image_num_range
         self.h_range = h_range
         self.rng = random.Random()
+        self.use_fixed_indices = use_fixed_indices
         
         # Uniformly sample from the range of possible image numbers
         # For any image number, the weight is 1.0 (uniform sampling). You can set any different weights here.
@@ -177,8 +181,13 @@ class DynamicBatchSampler(Sampler):
 
         while True:
             try:
-                # Sample random image number and aspect ratio
-                random_image_num = int(np.random.choice(self.possible_nums, p=self.normalized_weights))
+                # Sample random image number or use fixed value
+                if self.use_fixed_indices:
+                    # Use the maximum value from image_num_range (num_context_views)
+                    random_image_num = self.image_num_range[1]
+                else:
+                    random_image_num = int(np.random.choice(self.possible_nums, p=self.normalized_weights))
+                
                 random_ps_h = np.random.randint(low=(self.h_range[0] // 14), high=(self.h_range[1] // 14)+1)
 
                 # Update sampler parameters
@@ -296,12 +305,17 @@ class MixedBatchSampler(BatchSampler):
                 ds.epoch = 0
             if hasattr(ds, "set_epoch"):
                 ds.set_epoch(0)
+            
+            # Check if dataset has use_fixed_indices config
+            use_fixed_indices = getattr(ds.cfg.view_sampler, 'use_fixed_indices', False)
+            
             batch_sampler = DynamicBatchSampler(
                 sampler, 
                 [2, ds.cfg.view_sampler.num_context_views], 
                 ds.cfg.input_image_shape,
                 seed=42,
-                max_img_per_gpu=ds.cfg.view_sampler.max_img_per_gpu
+                max_img_per_gpu=ds.cfg.view_sampler.max_img_per_gpu,
+                use_fixed_indices=use_fixed_indices  # Pass the flag here
             )
             self.src_batch_samplers.append(batch_sampler)
         

@@ -114,6 +114,10 @@ class EncoderAnySplatCfg:
     conf_threshold: float = 0.1
     intermediate_layer_idx: Optional[List[int]] = None
     voxelize: bool = False
+    pretrained_features: bool = True
+    freeze_aggregator: bool = True
+    save_feats: bool = False
+    comp_aggregator: bool = False
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -130,31 +134,81 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
 
     def __init__(self, cfg: EncoderAnySplatCfg) -> None:
         super().__init__(cfg)
-        model_full = VGGT.from_pretrained("facebook/VGGT-1B")
-        # model_full = VGGT()
-        self.aggregator = model_full.aggregator.to(torch.bfloat16)
+        
+        self.pretrained_features = cfg.pretrained_features
         self.freeze_backbone = cfg.freeze_backbone
         self.distill = cfg.distill
         self.pred_pose = cfg.pred_pose
-
+        self.freeze_aggregator = cfg.freeze_aggregator
+        self.save_feats = cfg.save_feats
+        self.comp_aggregator = cfg.comp_aggregator
+        
+        # Load VGGT model but be selective about what we keep
+        model_full = VGGT.from_pretrained("facebook/VGGT-1B")
+        
+        # Always load these components as they're needed for processing features
         self.camera_head = model_full.camera_head
         if self.cfg.pred_head_type == "depth":
             self.depth_head = model_full.depth_head
         else:
             self.point_head = model_full.point_head
+        
+        print("self.pretrained_features:", self.pretrained_features)
+        print("self.freeze_aggregator:", self.freeze_aggregator)
+        if self.comp_aggregator:
+            # Initialize aggregator1 and freeze it properly
+            self.aggregator1 = model_full.aggregator.to(torch.bfloat16)
+            self.aggregator1.eval()  # Set to eval mode
+            for param in self.aggregator1.parameters():
+                param.requires_grad = False  # Freeze all parameters
+            print("Loaded and froze aggregator1 to GPU")
 
+        
+        
+        # Only initialize main aggregator if not using pretrained features
+        if not self.pretrained_features and not self.freeze_aggregator:
+            self.aggregator = model_full.aggregator.to(torch.bfloat16)
+            print("Loaded aggregator to GPU")
+        elif not self.pretrained_features and self.freeze_aggregator:
+            self.aggregator = model_full.aggregator.to(torch.bfloat16)
+            # Set to eval mode to disable dropout and stochastic depth
+            self.aggregator.eval()
+            for param in self.aggregator.parameters():
+                param.requires_grad = False
+            print("Loaded frozen aggregator to GPU in eval mode")
+        else:
+            self.aggregator = None
+            print("Skipped loading aggregator - using pretrained features")
+
+        # Handle distillation - we need aggregator for distillation even with pretrained features
         if self.distill:
-            self.distill_aggregator = copy.deepcopy(self.aggregator)
+            print("Distillation enabled - loading distill aggregator")
+            # For distillation, we always need aggregator (even with pretrained features)
+            if not self.freeze_aggregator:
+                self.distill_aggregator = copy.deepcopy(self.aggregator)
+                for param in self.distill_aggregator.parameters():
+                    param.requires_grad = False
+                    param.data = param.data.cpu()
+            elif self.freeze_aggregator and not self.pretrained_features:
+                self.distill_aggregator = self.aggregator
+                for param in self.distill_aggregator.parameters():
+                    param.requires_grad = False
+            else:
+                self.distill_aggregator = None
+
             self.distill_camera_head = copy.deepcopy(self.camera_head)
             self.distill_depth_head = copy.deepcopy(self.depth_head)
-            for module in [
-                self.distill_aggregator,
-                self.distill_camera_head,
-                self.distill_depth_head,
-            ]:
+            
+            # Move distillation modules to CPU to save GPU memory
+            for module in [self.distill_camera_head, self.distill_depth_head]:
                 for param in module.parameters():
                     param.requires_grad = False
                     param.data = param.data.cpu()
+        
+        # Clean up the full model to free memory
+        del model_full
+        torch.cuda.empty_cache()
+        print("Cleaned up full VGGT model from memory")
 
         if self.freeze_backbone:
             # Freeze backbone components
@@ -172,7 +226,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             if freeze_module == "None":
                 pass
 
-            elif freeze_module == "all":
+            elif freeze_module == "all" and self.aggregator is not None:
                 for param in self.aggregator.parameters():
                     param.requires_grad = False
 
@@ -183,7 +237,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                     "global+frame": ["global", "frame"],
                 }
 
-                if freeze_module in module_pairs:
+                if freeze_module in module_pairs and self.aggregator is not None:
                     for name, param in self.aggregator.named_parameters():
                         if any(m in name for m in module_pairs[freeze_module]):
                             param.requires_grad = False
@@ -212,6 +266,27 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             conf_activation="expp1",
             features=head_params.feature_dim,
         )
+        
+        # Print memory usage summary
+        if self.pretrained_features:
+            print("✅ Memory optimized setup:")
+            print("   - Aggregator: NOT loaded (using pretrained features)")
+            print(f"   - Distillation: {'enabled' if self.distill else 'disabled'}")
+            print(f"   - Camera head: loaded")
+            print(f"   - {self.cfg.pred_head_type.title()} head: loaded")
+            print(f"   - Gaussian heads: loaded")
+        else:
+            print("📊 Standard setup:")
+            print("   - Aggregator: loaded to GPU")
+            print(f"   - All other components: loaded")
+
+    def train(self, mode: bool = True):
+        """Override train() to keep frozen aggregator in eval mode."""
+        super().train(mode)
+        # Keep frozen aggregator in eval mode to ensure deterministic behavior
+        if self.freeze_aggregator and self.aggregator is not None:
+            self.aggregator.eval()
+        return self
 
     def map_pdf_to_opacity(
         self,
@@ -330,30 +405,65 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         image: torch.Tensor,
         global_step: int = 0,
         visualization_dump: Optional[dict] = None,
+        pretrained_features: Optional[List[torch.Tensor]] = None,
     ) -> Gaussians:
         device = image.device
         b, v, _, h, w = image.shape
         distill_infos = {}
+        if self.comp_aggregator:
+            self.aggregator1.eval()
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                    aggregated_tokens_list1, patch_start_idx1 = self.aggregator1(
+                        image.to(torch.bfloat16),
+                        intermediate_layer_idx=self.cfg.intermediate_layer_idx,
+                    )
+            if self.save_feats:
+                torch.save(aggregated_tokens_list1, f"/data/sudheerbabu/oct/models/4/feats/temp_feats/aggregated_list.pt")
+                print(f"Saved pretrained features at step {global_step}")
+                exit(0)
         if self.distill:
             distill_image = image.clone().detach()
+            # Initialize variables to None
+            distill_aggregated_tokens_list = None
+            distill_patch_start_idx = None
+
+            if self.freeze_aggregator and pretrained_features is not None:
+                print("TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT")
+
+                
+
+                distill_aggregated_tokens_list = [feat.squeeze(1) for feat in pretrained_features]
+                distill_patch_start_idx = 5  # patch_start_idx
+            else:
+                print("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF")
+                for module in [
+                self.distill_aggregator
+                ]:
+                    for param in module.parameters():
+                        param.data = param.data.to(device, non_blocking=True)
+
+                # Ensure distill_aggregator is in eval mode
+                self.distill_aggregator.eval()
+            
+                with torch.no_grad():
+                    # Process with bfloat16 precision
+                    with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                        distill_aggregated_tokens_list, distill_patch_start_idx = (
+                            self.distill_aggregator(
+                                distill_image.to(torch.bfloat16),
+                                intermediate_layer_idx=self.cfg.intermediate_layer_idx,
+                        )
+                    )
             for module in [
-                self.distill_aggregator,
                 self.distill_camera_head,
                 self.distill_depth_head,
             ]:
                 for param in module.parameters():
                     param.data = param.data.to(device, non_blocking=True)
 
-            with torch.no_grad():
-                # Process with bfloat16 precision
-                with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
-                    distill_aggregated_tokens_list, distill_patch_start_idx = (
-                        self.distill_aggregator(
-                            distill_image.to(torch.bfloat16),
-                            intermediate_layer_idx=self.cfg.intermediate_layer_idx,
-                        )
-                    )
 
+            with torch.no_grad():
                 # Process with default precision
                 with torch.amp.autocast("cuda", enabled=False):
                     # Get camera pose information
@@ -387,8 +497,17 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 conf_mask = distill_depth_conf > conf_threshold.unsqueeze(-1)
                 distill_infos["conf_mask"] = conf_mask
 
+                if not self.freeze_aggregator:
+                    for param in self.distill_aggregator.parameters():
+                        param.requires_grad = False
+                        param.data = param.data.cpu()
+
+                elif self.freeze_aggregator and not self.pretrained_features:
+                    for param in self.distill_aggregator.parameters():
+                        param.requires_grad = False
+                else:
+                    self.distill_aggregator = None
                 for module in [
-                    self.distill_aggregator,
                     self.distill_camera_head,
                     self.distill_depth_head,
                 ]:
@@ -401,11 +520,54 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 del distill_depth_map, distill_depth_conf
                 torch.cuda.empty_cache()
 
-        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
-            aggregated_tokens_list, patch_start_idx = self.aggregator(
-                image.to(torch.bfloat16),
-                intermediate_layer_idx=self.cfg.intermediate_layer_idx,
-            )
+        # Handle aggregated tokens - either from pretrained features or aggregator
+        print("pretrained_features:", self.pretrained_features)
+        print("freeze_aggregator:", self.freeze_aggregator)
+
+        if self.pretrained_features and self.freeze_aggregator:
+            aggregated_tokens_list = [feat.squeeze(1) for feat in pretrained_features]
+            if self.comp_aggregator:
+                #compare aggregated_tokens_list1 and aggregated_tokens_list
+                for i, (feat1, feat2) in enumerate(zip(aggregated_tokens_list1, aggregated_tokens_list)):
+                    # Ensure both tensors are float32 before comparison
+                    if torch.allclose(feat1.float(), feat2.float(), atol=1e-5):
+                        print(f"Layer {i}: Features match")
+                    else:
+                        diff = torch.abs(feat1.float() - feat2.float()).max()
+                        print(f"Layer {i}: Features do not match. Max difference: {diff.item():.6f}")
+
+
+            print("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
+
+
+
+            patch_start_idx = 5 # patch_start_idx # if patch_start_idx is not None else [0] * len(aggregated_tokens_list)
+            print(f"Using pretrained features with {len(aggregated_tokens_list)} layers", aggregated_tokens_list[0].shape , image.shape)                       
+        elif not self.pretrained_features and self.freeze_aggregator:
+            print("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+
+            # Ensure aggregator is in eval mode
+            self.aggregator.eval()
+        
+            with torch.no_grad():
+                # Process with bfloat16 precision
+                with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                    aggregated_tokens_list, patch_start_idx = (
+                        self.aggregator(
+                            image.to(torch.bfloat16),
+                            intermediate_layer_idx=self.cfg.intermediate_layer_idx,
+                    )
+                )
+
+            print(f"loading aggregator features with {len(aggregated_tokens_list)} layers", aggregated_tokens_list[0].shape, image.shape)
+        elif not self.pretrained_features and not self.freeze_aggregator:
+            print("***********************************************************************")
+            # Use aggregator to process images
+            with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                    aggregated_tokens_list, patch_start_idx = self.aggregator(
+                        image.to(torch.bfloat16),
+                        intermediate_layer_idx=self.cfg.intermediate_layer_idx,
+                    )
 
         with torch.amp.autocast("cuda", enabled=False):
             pred_pose_enc_list = self.camera_head(aggregated_tokens_list)

@@ -108,10 +108,11 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         visualization_dump: Optional[dict] = None,
         near: float = 0.01,
         far: float = 100.0,
+        pretrained_features: list[torch.Tensor] = None,
     ):
         b, v, c, h, w = context_image.shape
         device = context_image.device
-        encoder_output = self.encoder(context_image, global_step, visualization_dump=visualization_dump)
+        encoder_output = self.encoder(context_image, global_step, visualization_dump=visualization_dump, pretrained_features=pretrained_features)
         gaussians, pred_context_pose = encoder_output.gaussians, encoder_output.pred_context_pose
         output = self.decoder.forward(
             gaussians,
