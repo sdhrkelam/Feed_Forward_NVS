@@ -96,7 +96,7 @@ class EncoderAnySplatCfg:
     gs_prune: bool = False
     opacity_threshold: float = 0.001
     gs_keep_ratio: float = 1.0
-    pred_head_type: Literal["depth", "point"] = "point"
+    pred_head_type: Literal["depth", "point"] = "depth"
     freeze_backbone: bool = False
     freeze_module: Literal[
         "all",
@@ -114,10 +114,12 @@ class EncoderAnySplatCfg:
     conf_threshold: float = 0.1
     intermediate_layer_idx: Optional[List[int]] = None
     voxelize: bool = False
-    pretrained_features: bool = True
+    pretrained_features: bool = False
     freeze_aggregator: bool = True
     save_feats: bool = False
     comp_aggregator: bool = False
+    freeze_heads: bool = True
+    use_marble_gaussians: bool = True
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -142,6 +144,8 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         self.freeze_aggregator = cfg.freeze_aggregator
         self.save_feats = cfg.save_feats
         self.comp_aggregator = cfg.comp_aggregator
+        self.freeze_heads = cfg.freeze_heads
+        self.use_marble_gaussians = cfg.use_marble_gaussians
         
         # Load VGGT model but be selective about what we keep
         model_full = VGGT.from_pretrained("facebook/VGGT-1B")
@@ -155,6 +159,23 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         
         print("self.pretrained_features:", self.pretrained_features)
         print("self.freeze_aggregator:", self.freeze_aggregator)
+        # Freeze camera and depth/point heads if requested
+        if self.freeze_heads:
+            for param in self.camera_head.parameters():
+                param.requires_grad = False
+            self.camera_head.eval()
+            
+            if self.cfg.pred_head_type == "depth":
+                for param in self.depth_head.parameters():
+                    param.requires_grad = False
+                self.depth_head.eval()
+            else:
+                for param in self.point_head.parameters():
+                    param.requires_grad = False
+                self.point_head.eval()
+            
+            print("Froze camera_head and depth/point head")
+
         if self.comp_aggregator:
             # Initialize aggregator1 and freeze it properly
             self.aggregator1 = model_full.aggregator.to(torch.bfloat16)
@@ -258,6 +279,8 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         self.gs_params_head_type = cfg.gs_params_head_type
         # fake backbone for head parameters
         head_params = GSHeadParams()
+
+        print("Initializing Gaussian parameter head...",self.raw_gs_dim)
         self.gaussian_param_head = VGGT_DPT_GS_Head(
             dim_in=2048,
             patch_size=head_params.patch_size,
@@ -570,29 +593,56 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                     )
 
         with torch.amp.autocast("cuda", enabled=False):
-            pred_pose_enc_list = self.camera_head(aggregated_tokens_list)
-            last_pred_pose_enc = pred_pose_enc_list[-1]
-            extrinsic, intrinsic = pose_encoding_to_extri_intri(
-                last_pred_pose_enc, image.shape[-2:]
-            )  # only for debug
+            # Ensure frozen heads stay in eval mode
+            if self.freeze_heads:
+                with torch.no_grad():
+                    pred_pose_enc_list = self.camera_head(aggregated_tokens_list)
+                    last_pred_pose_enc = pred_pose_enc_list[-1]
+                    extrinsic, intrinsic = pose_encoding_to_extri_intri(
+                        last_pred_pose_enc, image.shape[-2:]
+                    )  # only for debug
 
-            if self.cfg.pred_head_type == "point":
-                pts_all, pts_conf = self.point_head(
-                    aggregated_tokens_list,
-                    images=image,
-                    patch_start_idx=patch_start_idx,
-                )
-            elif self.cfg.pred_head_type == "depth":
-                depth_map, depth_conf = self.depth_head(
-                    aggregated_tokens_list,
-                    images=image,
-                    patch_start_idx=patch_start_idx,
-                )
-                pts_all = batchify_unproject_depth_map_to_point_map(
-                    depth_map, extrinsic, intrinsic
-                )
+                    if self.cfg.pred_head_type == "point":
+                        pts_all, pts_conf = self.point_head(
+                            aggregated_tokens_list,
+                            images=image,
+                            patch_start_idx=patch_start_idx,
+                        )
+                    elif self.cfg.pred_head_type == "depth":
+                        depth_map, depth_conf = self.depth_head(
+                            aggregated_tokens_list,
+                            images=image,
+                            patch_start_idx=patch_start_idx,
+                        )
+                        pts_all = batchify_unproject_depth_map_to_point_map(
+                            depth_map, extrinsic, intrinsic
+                        )
+                    else:
+                        raise ValueError(f"Invalid pred_head_type: {self.cfg.pred_head_type}")
             else:
-                raise ValueError(f"Invalid pred_head_type: {self.cfg.pred_head_type}")
+                pred_pose_enc_list = self.camera_head(aggregated_tokens_list)
+                last_pred_pose_enc = pred_pose_enc_list[-1]
+                extrinsic, intrinsic = pose_encoding_to_extri_intri(
+                    last_pred_pose_enc, image.shape[-2:]
+                )  # only for debug
+
+                if self.cfg.pred_head_type == "point":
+                    pts_all, pts_conf = self.point_head(
+                        aggregated_tokens_list,
+                        images=image,
+                        patch_start_idx=patch_start_idx,
+                    )
+                elif self.cfg.pred_head_type == "depth":
+                    depth_map, depth_conf = self.depth_head(
+                        aggregated_tokens_list,
+                        images=image,
+                        patch_start_idx=patch_start_idx,
+                    )
+                    pts_all = batchify_unproject_depth_map_to_point_map(
+                        depth_map, extrinsic, intrinsic
+                    )
+                else:
+                    raise ValueError(f"Invalid pred_head_type: {self.cfg.pred_head_type}")
 
             if self.cfg.render_conf:
                 conf_valid = torch.quantile(
@@ -601,7 +651,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 conf_valid_mask = depth_conf > conf_valid
             else:
                 conf_valid_mask = torch.ones_like(depth_conf, dtype=torch.bool)
-
+        print("I am before gaussian head forward", aggregated_tokens_list[0].shape, pts_all.shape, image.shape)
         # dpt style gs_head input format
         out = self.gaussian_param_head(
             aggregated_tokens_list,
@@ -610,6 +660,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             patch_start_idx=patch_start_idx,
             image_size=(h, w),
         )
+        # exit("I am after gaussian head forward")
 
         del aggregated_tokens_list, patch_start_idx
         torch.cuda.empty_cache()
@@ -620,6 +671,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         anchor_feats, conf = out[:, :, : self.raw_gs_dim], out[:, :, self.raw_gs_dim]
 
         neural_feats_list, neural_pts_list = [], []
+        self.cfg.voxelize = False
         if self.cfg.voxelize:
             for b_i in range(b):
                 neural_pts, neural_feats = self.voxelizaton_with_fusion(

@@ -118,7 +118,9 @@ class DistillLoss(nn.Module):
                 i_weight = self.gamma ** (num_predictions - i - 1)
                 cur_pred_pose_enc = pred_pose_enc_list[i]
                 cur_pesudo_gt_pose_enc = pesudo_gt_pose_enc[i]
-                loss_pose += i_weight * huber_loss(cur_pred_pose_enc, cur_pesudo_gt_pose_enc).mean()
+                # loss_pose += i_weight * huber_loss(cur_pred_pose_enc, cur_pesudo_gt_pose_enc).mean()
+                loss_pose += i_weight * (cur_pred_pose_enc - cur_pesudo_gt_pose_enc).norm(dim=-1).mean()
+
             loss_pose = loss_pose / num_predictions
             loss_pose = torch.nan_to_num(loss_pose, nan=0.0, posinf=0.0, neginf=0.0)
         

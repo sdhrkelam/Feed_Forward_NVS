@@ -18,6 +18,7 @@ class GaussianAdapterCfg:
     gaussian_scale_min: float
     gaussian_scale_max: float
     sh_degree: int
+    use_marble_gaussians: bool = True
 
 
 class GaussianAdapter(nn.Module):
@@ -26,6 +27,7 @@ class GaussianAdapter(nn.Module):
     def __init__(self, cfg: GaussianAdapterCfg):
         super().__init__()
         self.cfg = cfg
+        self.use_marble_gaussians = cfg.use_marble_gaussians
 
         # Create a mask for the spherical harmonics coefficients. This ensures that at
         # initialization, the coefficients are biased towards having a large DC
@@ -50,25 +52,87 @@ class GaussianAdapter(nn.Module):
         eps: float = 1e-8,
     ) -> Gaussians:
         device = extrinsics.device
-        scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
-        
-        # Map scale features to valid scale range.
-        scale_min = self.cfg.gaussian_scale_min
-        scale_max = self.cfg.gaussian_scale_max
-        scales = scale_min + (scale_max - scale_min) * scales.sigmoid()
+        print("raw_gaussians dim:", raw_gaussians.shape[-1])
+        print("adapter d_in:", self.d_in)
+        print("use_marble:", self.cfg.use_marble_gaussians)
+
+        #####################################changed_for_marbels###################################
+        # --------------------------------------------------
+        # 1. Split raw Gaussian parameters
+        # --------------------------------------------------
+        if self.cfg.use_marble_gaussians:
+            # raw_gaussians = [radius, sh]
+            radius, sh = raw_gaussians.split((1, 3 * self.d_sh), dim=-1)
+
+            # isotropic scale in image space
+            scales = F.softplus(radius).repeat_interleave(3, dim=-1)
+
+            # identity rotation (no orientation)
+            rotations = torch.zeros(
+                (*scales.shape[:-1], 4),
+                device=device,
+                dtype=scales.dtype,
+            )
+            rotations[..., 0] = 1.0
+
+        else:
+            # raw_gaussians = [sx, sy, sz, qx, qy, qz, qw, sh]
+            scales, rotations, sh = raw_gaussians.split(
+                (3, 4, 3 * self.d_sh), dim=-1
+            )
+
+            scales = F.softplus(scales)
+            rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
+
+        # --------------------------------------------------
+        # 2. Convert image-space scale → world-space scale
+        # --------------------------------------------------
         h, w = image_shape
-        pixel_size = 1 / torch.tensor((w, h), dtype=torch.float32, device=device)
+        pixel_size = 1.0 / torch.tensor(
+            (w, h),
+            dtype=scales.dtype,
+            device=device,
+        )
+
         multiplier = self.get_scale_multiplier(intrinsics, pixel_size)
+
+        # depth-aware metric scaling (THIS WAS MISSING)
         scales = scales * depths[..., None] * multiplier[..., None]
 
-        # Normalize the quaternion features to yield a valid quaternion.
-        rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
+        # --------------------------------------------------
+        # 3. Clamp / bound scales (existing logic)
+        # --------------------------------------------------
+        scales = scales.clamp(
+            min=self.cfg.gaussian_scale_min,
+            max=self.cfg.gaussian_scale_max,
+        )
+
+        # --------------------------------------------------
+        # 4. Continue as usual
+        # --------------------------------------------------
+        covariances = build_covariance(scales, rotations)
+
+        #####################################changed_for_marbels###################################
+
+        # scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
+        
+        # # Map scale features to valid scale range.
+        # scale_min = self.cfg.gaussian_scale_min
+        # scale_max = self.cfg.gaussian_scale_max
+        # scales = scale_min + (scale_max - scale_min) * scales.sigmoid()
+        # h, w = image_shape
+        # pixel_size = 1 / torch.tensor((w, h), dtype=torch.float32, device=device)
+        # multiplier = self.get_scale_multiplier(intrinsics, pixel_size)
+        # scales = scales * depths[..., None] * multiplier[..., None]
+
+        # # Normalize the quaternion features to yield a valid quaternion.
+        # rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
 
         sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3)
         sh = sh.broadcast_to((*opacities.shape, 3, self.d_sh)) * self.sh_mask
 
         # Create world-space covariance matrices.
-        covariances = build_covariance(scales, rotations)
+        # covariances = build_covariance(scales, rotations)
         c2w_rotations = extrinsics[..., :3, :3]
         covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
 
@@ -105,9 +169,17 @@ class GaussianAdapter(nn.Module):
     def d_sh(self) -> int:
         return (self.cfg.sh_degree + 1) ** 2
 
+    # @property
+    # def d_in(self) -> int:
+    #     return 7 + 3 * self.d_sh
+
     @property
     def d_in(self) -> int:
+        print("use_marble_gaussians:",self.cfg.use_marble_gaussians)
+        if self.cfg.use_marble_gaussians:
+            return 1 + 3 * self.d_sh  # radius + SH
         return 7 + 3 * self.d_sh
+
 
 
 class UnifiedGaussianAdapter(GaussianAdapter):
@@ -122,14 +194,35 @@ class UnifiedGaussianAdapter(GaussianAdapter):
         intrinsics: Optional[Float[Tensor, "*#batch 3 3"]] = None,
         coordinates: Optional[Float[Tensor, "*#batch 2"]] = None,
     ) -> Gaussians:
-        scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
+        # scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
         
-        scales = 0.001 * F.softplus(scales)
-        scales = scales.clamp_max(0.3)
+        # scales = 0.001 * F.softplus(scales)
+        # scales = scales.clamp_max(0.3)
         
-        # Normalize the quaternion features to yield a valid quaternion.
-        rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
-        
+        # # Normalize the quaternion features to yield a valid quaternion.
+        # rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
+        if self.cfg.use_marble_gaussians:
+            # raw_gaussians = [radius, SH]
+            radius, sh = raw_gaussians.split((1, 3 * self.d_sh), dim=-1)
+
+            scales = F.softplus(radius).repeat_interleave(3, dim=-1)
+
+            rotations = torch.zeros(
+                (*scales.shape[:-1], 4),
+                device=raw_gaussians.device,
+                dtype=raw_gaussians.dtype,
+            )
+            rotations[..., 0] = 1.0  # identity quaternion
+
+        else:
+            scales, rotations, sh = raw_gaussians.split(
+                (3, 4, 3 * self.d_sh), dim=-1
+            )
+
+            scales = F.softplus(scales)
+            rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + 1e-8)
+
+                
         sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3)
         sh = sh.broadcast_to((*opacities.shape, 3, self.d_sh)) * self.sh_mask
         # print(scales.max())
@@ -156,13 +249,34 @@ class Unet3dGaussianAdapter(GaussianAdapter):
         intrinsics: Optional[Float[Tensor, "*#batch 3 3"]] = None,
         coordinates: Optional[Float[Tensor, "*#batch 2"]] = None,
     ) -> Gaussians:
-        scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
+        # scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
         
-        scales = 0.001 * F.softplus(scales)
-        scales = scales.clamp_max(0.3)
+        # scales = 0.001 * F.softplus(scales)
+        # scales = scales.clamp_max(0.3)
         
-        # Normalize the quaternion features to yield a valid quaternion.
-        rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
+        # # Normalize the quaternion features to yield a valid quaternion.
+        # rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
+        if self.cfg.use_marble_gaussians:
+            # raw_gaussians = [radius, SH]
+            radius, sh = raw_gaussians.split((1, 3 * self.d_sh), dim=-1)
+
+            scales = F.softplus(radius).repeat_interleave(3, dim=-1)
+
+            rotations = torch.zeros(
+                (*scales.shape[:-1], 4),
+                device=raw_gaussians.device,
+                dtype=raw_gaussians.dtype,
+            )
+            rotations[..., 0] = 1.0  # identity quaternion
+
+        else:
+            scales, rotations, sh = raw_gaussians.split(
+                (3, 4, 3 * self.d_sh), dim=-1
+            )
+
+            scales = F.softplus(scales)
+            rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + 1e-8)
+
         
         sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3)
         sh = sh.broadcast_to((*opacities.shape, 3, self.d_sh)) * self.sh_mask

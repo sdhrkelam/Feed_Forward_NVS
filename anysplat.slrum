@@ -1,0 +1,84 @@
+#!/bin/bash
+ 
+#SBATCH --job-name=Anys       # Job name
+#SBATCH --time=24:00:00             # Time limit (hh:mm:ss)
+#SBATCH --ntasks=1                  # Number of tasks (typically 1 for single-node jobs)
+#SBATCH --cpus-per-task=8           # Number of CPUs per task
+#SBATCH --mem=64GB                  # Memory allocation
+#SBATCH --partition=long           # Partition (long/short/a100)
+#SBATCH --gres=gpu:A6000:1         # GPU allocation (if needed, modify accordingly) | A5000/A6000/A100
+
+#SBATCH --output=/storage/users/rajivs/sudheerbabu/2026/jan/out/output_FH_marbel_sav.log
+#SBATCH --error=/storage/users/rajivs/sudheerbabu/2026/jan/out/error_FH_marbel_sav.log
+
+#SBATCH --chdir=/storage/users/rajivs/sudheerbabu/2026/jan/Feed_Forward_NVS
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+export WANDB_API_KEY=2de8ffb8f84b2f998b6c531f3cd3bae9f349b5a2
+# module spider cuda
+# grep -R "cuda/12.1" ~/.bashrc ~/.bash_profile ~/.profile your_job.slurm
+# nvidia-smi
+
+# Initialize Conda environment
+module load cuda/12.1
+source $HOME/miniconda3/etc/profile.d/conda.sh
+conda activate anysplat  # or your env name
+
+export LD_LIBRARY_PATH=/home/rajivs/sudheerbabu/miniconda3/envs/anysplat/lib:$LD_LIBRARY_PATH
+export LIBRARY_PATH=/home/rajivs/sudheerbabu/miniconda3/envs/anysplat/lib:$LIBRARY_PATH
+export CUDA_HOME=/storage/users/rajivs/sudheerbabu/2026/jan/Feed_Forward_NVS
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export CUDA_LAUNCH_BLOCKING=1
+
+
+# ✅ Optional: check CUDA is visible
+# nvcc --version || echo "nvcc not found"
+# ls $CUDA_HOME/include/cuda_runtime.h || echo "cuda_runtime.h not found"
+# python -c "import torch; print(torch.cuda.is_available())"
+
+# list scenes explicitly or use a range
+# scenes=(2 3 4 5 6)   # change/add scene numbers
+#scenes=(7 8 9 10 11 12)
+scenes=(7)
+# or use sequence: scenes=($(seq 35 50))
+
+for s in "${scenes[@]}"; do
+    echo "Starting scene $s"
+    # python src/main.py \
+    #     +experiment=dl3dv \
+    #     trainer.num_nodes=1 \
+    #     dataset.dl3dv.view_sampler.num_context_views=3 \
+    #     dataset.dl3dv.view_sampler.num_target_views=3 \
+    #     dataset.dl3dv.view_sampler.use_fixed_indices=true \
+    #     dataset.dl3dv.fixed_context_indices=[0,8,16] \
+    #     dataset.dl3dv.fixed_target_indices=[0,8,16] \
+    #     dataset.dl3dv.roots=[/storage/users/rajivs/sudheerbabu/Models_Nov/1/2/dataset/dl3dv-50-scenes/scene${s}] \
+    #     dataset.dl3dv.augment=false \
+    #     dataset.dl3dv.intr_augment=false \
+    #     dataset.dl3dv.input_image_shape=[448,448] \
+    #     model.encoder.distill=true \
+    #     dataset.dl3dv.view_sampler.max_img_per_gpu=3 \
+    #     wandb.mode=online \
+    #     hydra.run.dir=output_marbel/FA_marbel_scene${s}_0816 \
+    #     wandb.project=anysplat_marbel \
+    #     model.encoder.pretrained_features=false \
+    #     model.encoder.freeze_aggregator=true \
+    #     model.encoder.freeze_backbone=false \
+    #     optimizer.warm_up_steps=1000 \
+    #     model.encoder.freeze_module=all \
+    #     model.encoder.save_feats=false \
+    #     model.encoder.comp_aggregator=false \
+    #     model.encoder.voxelize=true \
+    #     model.encoder.freeze_heads=true \
+    #     checkpointing.save_top_k=1 \
+    #     model.encoder.use_marble_gaussians=true \
+    #     model.encoder.gaussian_adapter.use_marble_gaussians=true 
+
+    python src/eval_nvs.py \
+        --data_dir /storage/users/rajivs/sudheerbabu/Models_Nov/1/2/dataset/dl3dv-50-scenes/scene${s}/scene${s}/images_4 \
+        --checkpoint /storage/users/rajivs/sudheerbabu/2026/jan/Feed_Forward_NVS/output_marbel/FA_marbel_scene${s}_0816/checkpoints/epoch_4999-step_5000.ckpt \
+        --ctx_indices "0,8,16" --tgt_indices "4,5,10,12" --llffhold 8 \
+        --output_path /storage/users/rajivs/sudheerbabu/2026/jan/Feed_Forward_NVS/output_marbel/all_scenes_marbels/eval_scene${s}_train_0816
+    echo "Finished scene $s"
+done
