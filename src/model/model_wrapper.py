@@ -338,9 +338,9 @@ class ModelWrapper(LightningModule):
             gc.collect()
             torch.cuda.empty_cache()
 
-        if self.global_step == 5000:
-            print("exit(0)", self.global_step)
-            exit(0)
+        # if self.global_step == 6:
+        #     print("exit(0)", self.global_step)
+        #     exit(0)
 
         return total_loss
     

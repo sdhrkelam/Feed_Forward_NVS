@@ -33,8 +33,6 @@ model:
     freeze_aggregator: true
     save_feats: true
     comp_aggregator: true
-    freeze_heads: false
-    use_marble_gaussians: true
 
 dataset:
   dl3dv:
